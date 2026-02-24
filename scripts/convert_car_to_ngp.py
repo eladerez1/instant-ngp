@@ -146,7 +146,9 @@ def main():
     parser.add_argument('--frame_step', type=int, default=1,
                         help='Use every Nth frame (default: 1)')
     parser.add_argument('--cameras', nargs='+', default=None,
-                        help='Specific cameras to use (default: all)')
+                        help='Specific cameras to use (default: all 13 cameras including front/rear)')
+    parser.add_argument('--include_front_rear', action='store_true', default=True,
+                        help='Include front and rear cameras (at_front_00, at_front_01, at_rear_00, at_rear_01)')
     parser.add_argument('--aabb_scale', type=int, default=4,
                         help='AABB scale for instant-ngp (default: 4)')
     parser.add_argument('--symlinks', action='store_true',
@@ -178,7 +180,12 @@ def main():
     if args.cameras:
         cameras_to_use = args.cameras
     else:
-        cameras_to_use = list(intrinsics.keys())
+        # Default: all cameras (side + front + rear)
+        side_cameras = [f'at_cam_{i:02d}' for i in range(1, 10)]  # at_cam_01 to at_cam_09
+        front_rear_cameras = ['at_front_00', 'at_front_01', 'at_rear_00', 'at_rear_01']
+        cameras_to_use = side_cameras + front_rear_cameras
+        # Filter to only cameras that exist in calibration
+        cameras_to_use = [c for c in cameras_to_use if c in intrinsics and c in extrinsics]
     
     print(f"Using cameras: {cameras_to_use}")
     
