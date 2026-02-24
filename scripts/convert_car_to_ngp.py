@@ -232,8 +232,9 @@ def main():
             # T_cn_c0 is transform from cam0 frame to this camera frame
             T_cam_cam0 = cam_extrinsics['T_cn_c0']
             
-            # Camera 0 at frame 0 is at world origin
-            # At frame N, cam0 has moved in +X direction
+            # All cameras are fixed in the world, the car moves through them.
+            # From NeRF's perspective (car is stationary), all cameras move together.
+            # At frame N, all cameras have moved -N*motion_per_frame in X.
             T_cam0_world = np.eye(4)
             T_cam0_world[0, 3] = -frame_num * args.motion_per_frame
             
