@@ -289,6 +289,53 @@ def main():
     
     print(f"Created {len(frames)} frame entries")
     
+    # Post-process: Negate X translations (cameras move in -X direction)
+    # and center the scene around the origin
+    print("\nPost-processing camera positions...")
+    
+    # 1. Negate X translations for correct motion direction
+    for frame in frames:
+        frame['transform_matrix'][0][3] = -frame['transform_matrix'][0][3]
+    
+    # 2. Calculate scene bounds and center
+    min_x, max_x = float('inf'), float('-inf')
+    min_y, max_y = float('inf'), float('-inf')
+    min_z, max_z = float('inf'), float('-inf')
+    
+    for frame in frames:
+        m = frame['transform_matrix']
+        tx, ty, tz = m[0][3], m[1][3], m[2][3]
+        min_x, max_x = min(min_x, tx), max(max_x, tx)
+        min_y, max_y = min(min_y, ty), max(max_y, ty)
+        min_z, max_z = min(min_z, tz), max(max_z, tz)
+    
+    center_x = (min_x + max_x) / 2
+    center_y = (min_y + max_y) / 2
+    center_z = (min_z + max_z) / 2
+    
+    # 3. Shift all camera positions to center scene at origin
+    for frame in frames:
+        frame['transform_matrix'][0][3] -= center_x
+        frame['transform_matrix'][1][3] -= center_y
+        frame['transform_matrix'][2][3] -= center_z
+    
+    # 4. Calculate appropriate aabb_scale based on scene extent
+    max_extent = max(
+        abs(max_x - center_x), abs(min_x - center_x),
+        abs(max_y - center_y), abs(min_y - center_y),
+        abs(max_z - center_z), abs(min_z - center_z)
+    )
+    auto_aabb_scale = 2 ** math.ceil(math.log2(max_extent * 2))
+    auto_aabb_scale = max(4, auto_aabb_scale)
+    
+    print(f"  Negated X translations (motion now in -X direction)")
+    print(f"  Centered scene at origin (was at {center_x:.2f}, {center_y:.2f}, {center_z:.2f})")
+    print(f"  Camera bounds: X=[{min_x-center_x:.2f}, {max_x-center_x:.2f}]")
+    print(f"  Auto aabb_scale: {auto_aabb_scale}")
+    
+    # Use auto-calculated aabb_scale if user didn't specify
+    effective_aabb_scale = auto_aabb_scale if args.aabb_scale == 4 else args.aabb_scale
+    
     # Compute camera_angle_x and camera_angle_y from intrinsics
     w, h = first_resolution
     fx = first_intrinsics['fx']
@@ -310,7 +357,7 @@ def main():
         'k2': first_intrinsics['k2'],
         'p1': first_intrinsics['p1'],
         'p2': first_intrinsics['p2'],
-        'aabb_scale': args.aabb_scale,
+        'aabb_scale': effective_aabb_scale,
         'frames': frames,
     }
     
