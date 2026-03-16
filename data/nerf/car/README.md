@@ -4,10 +4,10 @@ Pipeline for evaluating NeRF reconstruction quality against CAD reference using 
 
 ## Overview
 
-This pipeline processes a raw NeRF mesh export and evaluates its accuracy against a CAD reference model through two complementary approaches:
+This pipeline processes a raw NeRF mesh export and evaluates its accuracy against a CAD reference model. It automatically generates both full cloud and outer shell benchmarks in a single pass:
 
 1. **Full Cloud Evaluation** - Uses all reconstructed points (1.2M points)
-2. **Outer Shell Evaluation** - Uses only visible surface points (48K points, 4%)
+2. **Outer Shell Evaluation** - Uses only visible surface points (48K points, 4%) - **automatically extracted**
 
 ## Prerequisites
 
@@ -26,7 +26,9 @@ conda activate env_instant_ngp
 - `base.obj` - Raw NeRF mesh exported from instant-ngp
 - `mesh/cad_sample.ply` - CAD reference (100K points with normals)
 
-## Pipeline 1: Full Cloud Evaluation
+## Pipeline: Full Cloud + Outer Shell Evaluation
+
+This pipeline runs both evaluations automatically in a single command.
 
 ### Step 1: Convert OBJ to PLY
 
@@ -37,10 +39,12 @@ python /isilon/Automotive/RnD/elad.e/obj_to_ply.py base.obj base.ply
 
 **Output:** `base.ply` (1,198,080 vertices)
 
-### Step 2: Rotate, Align, and Evaluate
+### Step 2: Rotate, Align, and Evaluate (Full Cloud + Outer Shell)
 
 ```bash
-python rotate_ply.py base.ply mesh/base_final.ply \
+python rotate_and_evaluate.py \
+    --input base.ply \
+    --output mesh/base_final.ply \
     --reference mesh/cad_sample.ply \
     --icp \
     --lock-rotation \
@@ -48,6 +52,8 @@ python rotate_ply.py base.ply mesh/base_final.ply \
 ```
 
 **What it does:**
+
+**Full Cloud Processing:**
 1. Applies initial rotation: -90° Z-axis + 60° Y-axis
 2. ICP alignment (translation-only, preserves rotation)
    - Multi-scale: 0.4m → 0.2m → 0.1m
@@ -57,12 +63,24 @@ python rotate_ply.py base.ply mesh/base_final.ply \
    - Completeness: CAD → NeRF coverage
 4. Generates heat map (white=close, red=far, 10cm scale)
 
+**Outer Shell Processing (Automatic):**
+5. Extracts outer shell from aligned cloud:
+   - Angular hash map (360×180 bins, 1° resolution)
+   - Keeps only farthest point per direction
+   - Removes occluded/interior points
+6. Re-aligns outer shell with ICP (full 6-DOF)
+7. Computes outer shell metrics
+8. Generates outer shell heat map
+
 **Outputs:**
 - `mesh/base_final.ply` - Aligned point cloud (1.2M points)
 - `mesh/base_final_heatmap.ply` - Distance-colored visualization
 - `mesh/base_final_metrics.json` - Full evaluation results
+- `mesh/base_final_outer_shell_aligned.ply` - Aligned outer shell (48K points)
+- `mesh/base_final_outer_shell_heatmap.ply` - Outer shell heat map
+- `mesh/base_final_outer_metrics.json` - Outer shell evaluation results
 
-**Results:**
+**Full Cloud Results:**
 ```
 Accuracy (NeRF → CAD):
   Mean:   8.88 cm
@@ -79,31 +97,7 @@ Completeness (CAD coverage):
 ICP: fitness=0.714, RMSE=4.86cm
 ```
 
-## Pipeline 2: Outer Shell Evaluation
-
-### Step 3: Extract Outer Shell and Evaluate
-
-```bash
-python compute_outer_shell.py
-```
-
-**What it does:**
-1. Loads aligned point cloud from Pipeline 1 (`mesh/base_final.ply`)
-2. Builds angular hash map (360×180 bins, 1° resolution)
-3. Extracts outer shell:
-   - Groups points by spherical direction from center
-   - Keeps only farthest point per direction
-   - Removes occluded/interior points
-4. Re-aligns outer shell with ICP (full 6-DOF)
-5. Computes evaluation metrics
-6. Generates heat map
-
-**Outputs:**
-- `mesh/base_final_outer_shell_aligned.ply` - Surface points (48K points)
-- `mesh/base_final_outer_shell_heatmap.ply` - Distance-colored surface
-- `mesh/base_final_outer_metrics.json` - Outer shell evaluation results
-
-**Results:**
+**Outer Shell Results:**
 ```
 Accuracy (Outer Shell → CAD):
   Mean:   7.31 cm
@@ -127,6 +121,8 @@ Points: 48,085 (4.0% of original)
 ```bash
 python compare_benchmarks.py
 ```
+
+This script compares VGGT, NeRF full cloud, and NeRF outer shell benchmarks.
 
 **Output:**
 ```
@@ -217,8 +213,7 @@ car/
 ├── README.md                              # This file
 ├── base.obj                               # Raw NeRF mesh from instant-ngp
 ├── base.ply                               # Converted to PLY format
-├── rotate_ply.py                          # Full cloud alignment & evaluation
-├── compute_outer_shell.py                 # Outer shell extraction & evaluation
+├── rotate_and_evaluate.py                 # Main pipeline: alignment + evaluation + outer shell
 ├── compare_benchmarks.py                  # Benchmark comparison script
 └── mesh/
     ├── cad_sample.ply                     # CAD reference (100K points)
@@ -241,19 +236,20 @@ conda activate env_instant_ngp
 # Step 1: Convert OBJ to PLY
 python /isilon/Automotive/RnD/elad.e/obj_to_ply.py base.obj base.ply
 
-# Step 2: Full cloud evaluation
-python rotate_ply.py base.ply mesh/base_final.ply \
+# Step 2: Full cloud + outer shell evaluation (automatic)
+python rotate_and_evaluate.py \
+    --input base.ply \
+    --output mesh/base_final.ply \
     --reference mesh/cad_sample.ply \
     --icp \
     --lock-rotation \
     --evaluate
 
-# Step 3: Outer shell evaluation
-python compute_outer_shell.py
-
-# Step 4: Compare benchmarks
+# Step 3: Compare benchmarks
 python compare_benchmarks.py
 ```
+
+**Note:** Outer shell extraction and evaluation now happens automatically when using `--evaluate` flag. No need to run separate scripts.
 
 ## Visualization
 

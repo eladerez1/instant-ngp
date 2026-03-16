@@ -417,6 +417,227 @@ def extract_outer_points(points, percentile=90):
     return outer_indices
 
 
+def compute_outer_shell(aligned_ply_path, cad_pcd, output_dir, base_name):
+    """Extract outer shell and compute evaluation metrics.
+    
+    Args:
+        aligned_ply_path: Path to aligned NeRF point cloud
+        cad_pcd: Open3D point cloud of CAD reference
+        output_dir: Directory to save outputs
+        base_name: Base name for output files
+    """
+    from scipy.spatial import KDTree
+    from collections import defaultdict
+    
+    # Load aligned NeRF point cloud
+    logger.info("Loading aligned point cloud...")
+    nerf_pcd = o3d.io.read_point_cloud(aligned_ply_path)
+    nerf_points = np.asarray(nerf_pcd.points)
+    cad_points = np.asarray(cad_pcd.points)
+    
+    # Extract outer shell using angular hash map
+    logger.info("Extracting outer shell using angular hash map...")
+    center = np.mean(nerf_points, axis=0)
+    
+    # Compute direction vectors for all points
+    directions = nerf_points - center
+    distances = np.linalg.norm(directions, axis=1)
+    valid_mask = distances > 1e-6
+    directions[valid_mask] = directions[valid_mask] / distances[valid_mask, np.newaxis]
+    
+    # Convert to spherical coordinates (theta, phi)
+    theta = np.arctan2(directions[:, 1], directions[:, 0])  # -pi to pi
+    phi = np.arccos(np.clip(directions[:, 2], -1, 1))  # 0 to pi
+    
+    # Discretize angles into bins (1 degree resolution)
+    theta_bins = 360
+    phi_bins = 180
+    theta_indices = ((theta + np.pi) / (2 * np.pi) * theta_bins).astype(int)
+    phi_indices = (phi / np.pi * phi_bins).astype(int)
+    
+    # Create hash map: (theta_bin, phi_bin) -> list of point indices
+    angle_map = defaultdict(list)
+    for i in range(len(nerf_points)):
+        if valid_mask[i]:
+            key = (theta_indices[i], phi_indices[i])
+            angle_map[key].append(i)
+    
+    logger.info(f"Created hash map with {len(angle_map)} angular bins")
+    
+    # For each point, check if there's a farther point in the same angular bin
+    logger.info(f"Processing {len(nerf_points)} points...")
+    outer_mask = np.ones(len(nerf_points), dtype=bool)
+    
+    for i in range(len(nerf_points)):
+        if i % 100000 == 0 and i > 0:
+            logger.info(f"  Processed {i}/{len(nerf_points)} points...")
+        
+        if not valid_mask[i]:
+            continue
+        
+        # Get the angular bin for this point
+        key = (theta_indices[i], phi_indices[i])
+        
+        # Get all points in the same angular bin
+        candidates = angle_map[key]
+        
+        # Check if there's a farther point on the same ray
+        current_dist = distances[i]
+        
+        for idx in candidates:
+            if idx == i:
+                continue
+            
+            # If there's a farther point, current point is occluded
+            if distances[idx] > current_dist:
+                outer_mask[i] = False
+                break
+    
+    outer_indices = np.where(outer_mask)[0]
+    outer_points = nerf_points[outer_indices]
+    
+    logger.info(f'Total points: {len(nerf_points)}')
+    logger.info(f'Outer shell points: {len(outer_points)} ({100*len(outer_points)/len(nerf_points):.1f}%)')
+    logger.info(f'Removed interior points: {len(nerf_points) - len(outer_points)}')
+    
+    # Create outer shell point cloud
+    outer_pcd = o3d.geometry.PointCloud()
+    outer_pcd.points = o3d.utility.Vector3dVector(outer_points)
+    
+    # Run ICP alignment on outer shell
+    logger.info("\n=== Running ICP alignment on outer shell ===")
+    if not cad_pcd.has_normals():
+        logger.info("Estimating normals on CAD...")
+        cad_pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.05, max_nn=30))
+    
+    # Multi-scale ICP
+    scales = [0.4, 0.2, 0.1]
+    current_T = np.eye(4)
+    
+    for i, dist in enumerate(scales):
+        result = o3d.pipelines.registration.registration_icp(
+            outer_pcd,
+            cad_pcd,
+            dist,
+            current_T,
+            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100),
+        )
+        current_T = result.transformation
+        logger.info(f"ICP scale {i} (dist={dist:.3f}m): fitness={result.fitness:.4f}, inlier_rmse={result.inlier_rmse:.4f}")
+    
+    # Apply transformation
+    outer_pcd.transform(current_T)
+    outer_points_aligned = np.asarray(outer_pcd.points)
+    
+    logger.info(f"\nTransformation matrix:")
+    logger.info(current_T)
+    
+    # Create heat map with normal-based distances
+    logger.info("\n=== Creating outer shell heat map ===")
+    cad_normals = np.asarray(cad_pcd.normals)
+    cad_tree = KDTree(cad_points)
+    
+    distances_to_cad = np.zeros(len(outer_points_aligned))
+    k_candidates = 30
+    
+    for i in range(len(outer_points_aligned)):
+        if i % 5000 == 0 and i > 0:
+            logger.info(f"  Processed {i}/{len(outer_points_aligned)} points...")
+        
+        recon_pt = outer_points_aligned[i]
+        dists_nn, indices_nn = cad_tree.query(recon_pt, k=min(k_candidates, len(cad_points)))
+        
+        min_perpendicular_dist = float('inf')
+        for cad_idx in indices_nn:
+            cad_pt = cad_points[cad_idx]
+            cad_normal = cad_normals[cad_idx]
+            
+            # Vector from CAD to reconstruction point
+            vec = recon_pt - cad_pt
+            # Project onto normal to get perpendicular distance
+            perpendicular_dist = abs(np.dot(vec, cad_normal))
+            
+            if perpendicular_dist < min_perpendicular_dist:
+                min_perpendicular_dist = perpendicular_dist
+        
+        distances_to_cad[i] = min_perpendicular_dist
+    
+    # Create color map: white (close) to red (far)
+    max_dist = 0.10  # 10cm scale
+    colors = np.zeros((len(distances_to_cad), 3))
+    for i, d in enumerate(distances_to_cad):
+        ratio = min(d / max_dist, 1.0)
+        colors[i] = [1.0, 1.0 - ratio, 1.0 - ratio]  # white -> red
+    
+    outer_pcd.colors = o3d.utility.Vector3dVector(colors)
+    
+    # Save heat map
+    heatmap_path = os.path.join(output_dir, f"{base_name}_outer_shell_heatmap.ply")
+    o3d.io.write_point_cloud(heatmap_path, outer_pcd)
+    logger.info(f"Saved heat map to: {heatmap_path}")
+    
+    # Compute outer shell metrics
+    logger.info("\n=== Computing outer shell metrics ===")
+    outer_dists, _ = cad_tree.query(outer_points_aligned)
+    
+    # Compute completeness metrics (how much of CAD is covered)
+    nerf_tree = KDTree(outer_points_aligned)
+    cad_dists, _ = nerf_tree.query(cad_points)
+    
+    completeness_1cm = np.mean(cad_dists < 0.01) * 100
+    completeness_2cm = np.mean(cad_dists < 0.02) * 100
+    completeness_5cm = np.mean(cad_dists < 0.05) * 100
+    
+    metrics = {
+        'num_outer_points': len(outer_points_aligned),
+        'num_total_points': len(nerf_points),
+        'outer_percentage': float(100*len(outer_points_aligned)/len(nerf_points)),
+        'method': 'angular_hash_map',
+        'theta_bins': theta_bins,
+        'phi_bins': phi_bins,
+        'icp_fitness': float(result.fitness),
+        'icp_inlier_rmse': float(result.inlier_rmse),
+        'accuracy_mean': float(np.mean(outer_dists)),
+        'accuracy_median': float(np.median(outer_dists)),
+        'accuracy_std': float(np.std(outer_dists)),
+        'accuracy_rmse': float(np.sqrt(np.mean(outer_dists**2))),
+        'accuracy_90th': float(np.percentile(outer_dists, 90)),
+        'accuracy_95th': float(np.percentile(outer_dists, 95)),
+        'completeness_1cm': float(completeness_1cm),
+        'completeness_2cm': float(completeness_2cm),
+        'completeness_5cm': float(completeness_5cm),
+    }
+    
+    # Save metrics
+    metrics_path = os.path.join(output_dir, f"{base_name}_outer_metrics.json")
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    logger.info(f"Saved metrics to: {metrics_path}")
+    
+    # Save aligned outer shell PLY
+    aligned_outer_pcd = o3d.geometry.PointCloud()
+    aligned_outer_pcd.points = o3d.utility.Vector3dVector(outer_points_aligned)
+    outer_ply_path = os.path.join(output_dir, f"{base_name}_outer_shell_aligned.ply")
+    o3d.io.write_point_cloud(outer_ply_path, aligned_outer_pcd)
+    logger.info(f"Saved aligned outer shell to: {outer_ply_path}")
+    
+    # Print summary
+    logger.info('\n=== Outer Shell Benchmark (After ICP Alignment) ===')
+    logger.info(f'ICP Fitness:     {metrics["icp_fitness"]:.4f}')
+    logger.info(f'ICP Inlier RMSE: {metrics["icp_inlier_rmse"]*100:.2f} cm')
+    logger.info(f'\nAccuracy (NeRF to CAD):')
+    logger.info(f'Mean:   {metrics["accuracy_mean"]*100:.2f} cm')
+    logger.info(f'Median: {metrics["accuracy_median"]*100:.2f} cm')
+    logger.info(f'RMSE:   {metrics["accuracy_rmse"]*100:.2f} cm')
+    logger.info(f'90th:   {metrics["accuracy_90th"]*100:.2f} cm')
+    logger.info(f'95th:   {metrics["accuracy_95th"]*100:.2f} cm')
+    logger.info(f'\nCompleteness (CAD coverage):')
+    logger.info(f'<1cm:  {metrics["completeness_1cm"]:.2f}%')
+    logger.info(f'<2cm:  {metrics["completeness_2cm"]:.2f}%')
+    logger.info(f'<5cm:  {metrics["completeness_5cm"]:.2f}%')
+
+
 def compute_metrics(recon_points, cad_points):
     """Compute accuracy and completeness metrics after alignment."""
     from scipy.spatial import KDTree
@@ -656,26 +877,6 @@ def rotate_ply(input_path, output_path, reference_ply=None, use_pca=False, use_i
             json.dump(asdict(metrics), f, indent=2)
         logger.info(f"Saved metrics to: {metrics_path}")
         
-        # Extract outer points and compute outer-only metrics
-        logger.info("\n=== Outer Shell Benchmark ===")
-        outer_indices = extract_outer_points(np.array(rotated_vertices), percentile=90)
-        outer_points = np.array(rotated_vertices)[outer_indices]
-        
-        # Compute metrics for outer points only
-        logger.info("Computing metrics for outer shell only...")
-        outer_metrics = compute_metrics(outer_points, ref_points)
-        
-        # Save outer metrics
-        outer_metrics_path = os.path.join(output_dir, f"{base_name}_outer_metrics.json")
-        with open(outer_metrics_path, 'w') as f:
-            json.dump(asdict(outer_metrics), f, indent=2)
-        logger.info(f"Saved outer shell metrics to: {outer_metrics_path}")
-        
-        # Save outer points to PLY
-        outer_ply_path = os.path.join(output_dir, f"{base_name}_outer_shell.ply")
-        save_ply_from_points(outer_points, outer_ply_path)
-        logger.info(f"Saved outer shell point cloud to: {outer_ply_path}")
-        
         # Print summary
         logger.info("=== Evaluation Summary ===")
         logger.info(f"Accuracy (NeRF → CAD):")
@@ -692,14 +893,6 @@ def rotate_ply(input_path, output_path, reference_ply=None, use_pca=False, use_i
         logger.info(f"  @ 5cm:  {metrics.completeness_at_5cm*100:.1f}%")
         logger.info(f"  @ 10cm: {metrics.completeness_at_10cm*100:.1f}%")
         
-        logger.info("\n=== Outer Shell Benchmark Summary ===")
-        logger.info(f"Outer Shell Accuracy (NeRF outer → CAD):")
-        logger.info(f"  Mean:   {outer_metrics.accuracy_mean*100:.2f} cm")
-        logger.info(f"  Median: {outer_metrics.accuracy_median*100:.2f} cm")
-        logger.info(f"  RMSE:   {outer_metrics.accuracy_rmse*100:.2f} cm")
-        logger.info(f"  90th:   {outer_metrics.accuracy_90th*100:.2f} cm")
-        logger.info(f"  95th:   {outer_metrics.accuracy_95th*100:.2f} cm")
-        
         # Generate normal-based heat map
         logger.info("Generating normal-based distance heat map...")
         colored_pcd = create_normal_distance_colored_pointcloud(result_pcd, ref_pcd)
@@ -708,14 +901,22 @@ def rotate_ply(input_path, output_path, reference_ply=None, use_pca=False, use_i
         heatmap_path = os.path.join(output_dir, f"{base_name}_heatmap.ply")
         o3d.io.write_point_cloud(heatmap_path, colored_pcd)
         logger.info(f"Saved heat map to: {heatmap_path}")
+        
+        # === OUTER SHELL EXTRACTION AND EVALUATION ===
+        logger.info("\n" + "="*80)
+        logger.info("=== OUTER SHELL EXTRACTION AND EVALUATION ===")
+        logger.info("="*80)
+        
+        compute_outer_shell(output_path, ref_pcd, output_dir, base_name)
+        
     elif evaluate and not HAS_OPEN3D:
         logger.warning("Open3D is required for evaluation. Install with: pip install open3d")
 
 
 def main():
     parser = argparse.ArgumentParser(description='Rotate PLY file -90° around Z-axis and align to reference')
-    parser.add_argument('input', help='Input PLY file')
-    parser.add_argument('output', nargs='?', help='Output PLY file (default: input_rotated.ply)')
+    parser.add_argument('--input', required=True, help='Input PLY file')
+    parser.add_argument('--output', required=True, help='Output PLY file')
     parser.add_argument('--reference', help='Reference PLY file to match center (default: mesh/cad_sample.ply)')
     parser.add_argument('--pca', action='store_true', help='Use PCA for coarse alignment')
     parser.add_argument('--icp', action='store_true', help='Use ICP for fine alignment (requires Open3D)')
@@ -733,12 +934,7 @@ def main():
         print(f"Error: Input file not found: {input_path}")
         sys.exit(1)
     
-    if args.output:
-        output_path = args.output
-    else:
-        # Generate output filename
-        base, ext = os.path.splitext(input_path)
-        output_path = f"{base}_rotated{ext}"
+    output_path = args.output
     
     # Default reference PLY
     reference_ply = args.reference
