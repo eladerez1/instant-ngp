@@ -916,7 +916,7 @@ def rotate_ply(input_path, output_path, reference_ply=None, use_pca=False, use_i
 def main():
     parser = argparse.ArgumentParser(description='Rotate PLY file -90° around Z-axis and align to reference')
     parser.add_argument('--input', required=True, help='Input PLY file')
-    parser.add_argument('--output', required=True, help='Output PLY file')
+    parser.add_argument('--output', required=True, help='Output folder for generated files')
     parser.add_argument('--reference', help='Reference PLY file to match center (default: mesh/cad_sample.ply)')
     parser.add_argument('--pca', action='store_true', help='Use PCA for coarse alignment')
     parser.add_argument('--icp', action='store_true', help='Use ICP for fine alignment (requires Open3D)')
@@ -934,7 +934,13 @@ def main():
         print(f"Error: Input file not found: {input_path}")
         sys.exit(1)
     
-    output_path = args.output
+    # Create output directory
+    output_dir = args.output
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Generate output filename based on input file name
+    input_name = os.path.splitext(os.path.basename(input_path))[0]
+    output_path = os.path.join(output_dir, f"{input_name}_rotated.ply")
     
     # Default reference PLY
     reference_ply = args.reference

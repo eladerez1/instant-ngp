@@ -156,6 +156,157 @@ Completeness (@1cm):
   • Outer Shell vs NeRF: -75.0% (worse)
 ```
 
+## SDF Mesh Generation
+
+### Create Shrink-Wrapped Mesh from Outer Shell
+
+```bash
+python create_sdf_mesh.py \
+    --input mesh/base_final_outer_shell_aligned.ply \
+    --output mesh/base_final_outer_sdf_mesh_shrinkwrap.ply \
+    --method bpa \
+    --bpa-radius 0.08 \
+    --remove-outliers \
+    --clean-mesh \
+    --save-metrics
+```
+
+**Ball Pivoting Algorithm (Recommended for Shrink Wrapping):**
+
+The BPA method creates a tight, clean mesh that removes blobs and artifacts:
+
+1. **Ball Pivoting** - Conceptually "rolls" a virtual ball across the point cloud surface
+2. **Blob Removal** - Automatically removes disconnected components from Poisson artifacts
+3. **Smoothing** - Optional Laplacian smoothing for cleaner geometry
+4. **Result** - Clean, topology-preserving surface mesh
+
+**Example Results:**
+```
+Input: 48,085 points (46,581 after outlier removal)
+BPA Output: 5,960 vertices, 9,177 triangles
+File size: 397 KB (vs 19-25 MB for Poisson)
+Surface area: 2.98 m²
+```
+
+**Usage Examples:**
+
+```bash
+# Shrink-wrapped mesh with outlier removal (default)
+python create_sdf_mesh.py --input mesh/base_final_outer_shell_aligned.ply \
+                          --output mesh/base_final_outer_sdf_mesh_shrinkwrap.ply \
+                          --method bpa \
+                          --remove-outliers
+
+# Tighter wrap (smaller radius)
+python create_sdf_mesh.py --input mesh/base_final_outer_shell_aligned.ply \
+                          --output mesh/base_final_outer_sdf_mesh_tight.ply \
+                          --method bpa \
+                          --bpa-radius 0.05 \
+                          --remove-outliers
+
+# Smoother result (more smoothing)
+python create_sdf_mesh.py --input mesh/base_final_outer_shell_aligned.ply \
+                          --output mesh/base_final_outer_sdf_mesh_smooth.ply \
+                          --method bpa \
+                          --remove-outliers \
+                          --smooth-iterations 5
+
+# Poisson reconstruction (high detail, more blobs)
+python create_sdf_mesh.py --input mesh/base_final_outer_shell_aligned.ply \
+                          --output mesh/base_final_outer_sdf_mesh_poisson.ply \
+                          --method poisson \
+                          --depth 12 \
+                          --scale 1.5 \
+                          --remove-outliers
+
+# Visualize result
+python create_sdf_mesh.py --input mesh/base_final_outer_shell_aligned.ply \
+                          --output mesh/base_final_outer_sdf_mesh.ply \
+                          --method bpa \
+                          --remove-outliers \
+                          --visualize
+```
+
+**Method Comparison:**
+
+| Aspect | Ball Pivoting (BPA) | Poisson | TSDF |
+|--------|-------------------|---------|------|
+| **Shrink wrap** | ✓ (tight) | ✗ (blobs) | ✗ |
+| **Blob artifacts** | None | Many | Voxelated |
+| **File size** | 397 KB | 19-25 MB | N/A |
+| **Vertices** | 5,960 | 251,399 | N/A |
+| **Triangles** | 9,177 | 1,006,670 | N/A |
+| **Detail level** | Low-Med | Very High | Medium |
+| **Speed** | Fast | Slow | Very slow |
+| **Watertight** | No | No | Voxel-based |
+
+**Parameters:**
+
+| Parameter | BPA | Poisson | Effect |
+|-----------|-----|---------|--------|
+| `--bpa-radius` | 0.05-0.15 | - | Ball size (smaller = tighter) |
+| `--depth` | - | 10-13 | Octree detail |
+| `--scale` | - | 1.1-1.5 | Boundary expansion |
+| `--smooth-iterations` | 1-5 | - | Smoothing passes (more = smoother) |
+| `--remove-blobs` | True | - | Remove disconnected parts |
+| `--smooth` | True | - | Apply Laplacian smoothing |
+
+### Create Detailed Poisson Mesh from Outer Shell
+
+```bash
+python create_sdf_mesh.py \
+    --input mesh/base_final_outer_shell_aligned.ply \
+    --output mesh/base_final_outer_sdf_mesh_detailed.ply \
+    --method poisson \
+    --depth 12 \
+    --scale 1.5 \
+    --remove-outliers \
+    --clean-mesh \
+    --save-metrics
+```
+
+**Poisson Reconstruction:**
+
+Creates very detailed meshes with many triangles, but may include blob artifacts:
+
+1. **Outlier Removal** (optional but recommended)
+   - Statistical method: Removes points with distance > N standard deviations from neighbors
+   - Radius method: Removes points with fewer than K neighbors within radius R
+   - Default: Removes ~3% of outlier points
+
+2. **Poisson Surface Reconstruction**
+   - Creates watertight mesh from point cloud
+   - Parameters:
+     - `--depth`: Octree depth (higher = more detail, 10-12 recommended)
+     - `--scale`: Bounding box scale (higher = more complete mesh, 1.3-1.5 recommended)
+
+3. **Mesh Cleanup** (optional)
+   - Removes disconnected blob components
+   - Applies Laplacian smoothing for cleaner surface
+
+**Example Results:**
+```
+Input: 48,085 points (46,581 after outlier removal)
+Poisson Output: 251,399 vertices, 1,006,670 triangles
+File size: 25 MB
+Surface area: 149.39 m²
+```
+
+**Outlier Removal Methods:**
+
+1. **Statistical** (default, recommended)
+   - Computes mean distance to K neighbors
+   - Removes points with distance > mean + N×std
+   - Parameters:
+     - `--outlier-neighbors` (20): Number of neighbors to check
+     - `--outlier-std` (2.0): Standard deviation threshold
+
+2. **Radius** (for structured noise)
+   - Removes points with fewer than K neighbors within radius R
+   - Parameters:
+     - `--outlier-radius` (0.1): Search radius in meters
+     - `--outlier-radius-neighbors` (30): Minimum neighbors required
+
 ## Key Findings
 
 ### Accuracy
@@ -214,15 +365,20 @@ car/
 ├── base.obj                               # Raw NeRF mesh from instant-ngp
 ├── base.ply                               # Converted to PLY format
 ├── rotate_and_evaluate.py                 # Main pipeline: alignment + evaluation + outer shell
+├── create_sdf_mesh.py                     # SDF mesh generation from outer shell
 ├── compare_benchmarks.py                  # Benchmark comparison script
 └── mesh/
     ├── cad_sample.ply                     # CAD reference (100K points)
     ├── base_final.ply                     # Aligned full cloud
     ├── base_final_heatmap.ply             # Full cloud heat map
     ├── base_final_metrics.json            # Full cloud results
-    ├── base_final_outer_shell_aligned.ply # Aligned outer shell
+    ├── base_final_outer_shell_aligned.ply # Aligned outer shell (48K points)
     ├── base_final_outer_shell_heatmap.ply # Outer shell heat map
-    └── base_final_outer_metrics.json      # Outer shell results
+    ├── base_final_outer_metrics.json      # Outer shell evaluation results
+    ├── base_final_outer_sdf_mesh.ply      # SDF mesh from outer shell (basic)
+    ├── base_final_outer_sdf_mesh_metrics.json # SDF mesh metrics
+    ├── base_final_outer_sdf_mesh_watertight.ply # SDF mesh with outliers removed
+    └── base_final_outer_sdf_mesh_watertight_metrics.json # Watertight mesh metrics
 ```
 
 ## Complete Pipeline (One Command)
